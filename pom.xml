@@ -535,6 +535,7 @@
             <showWarnings>true</showWarnings>
             <showDeprecation>false</showDeprecation>
             <compilerArgument>-Xlint:-options</compilerArgument>
+            <compilerArgument>-XDignore.symbol.file</compilerArgument>
           </configuration>
         </plugin>
         <!-- Test oriented plugins -->
@@ -622,7 +623,7 @@
         <plugin>
           <groupId>org.codehaus.mojo</groupId>
           <artifactId>findbugs-maven-plugin</artifactId>
-          <version>3.0.0</version>
+          <version>3.0.4</version>
           <!--NOTE: Findbugs 3.0.0 requires jdk7-->
           <configuration>
             <excludeFilterFile>${project.basedir}/../dev-support/findbugs-exclude.xml</excludeFilterFile>
@@ -1276,7 +1277,7 @@
     <compileSource>1.7</compileSource>
     <!-- Build dependencies -->
     <maven.min.version>3.0.3</maven.min.version>
-    <javaVersion>1.7</javaVersion>
+    <javaVersion>1.8</javaVersion>
     <targetJavaVersion>1.7</targetJavaVersion>
     <sourceJavaVersion>${targetJavaVersion}</sourceJavaVersion>
     <java.min.version>${javaVersion}</java.min.version>
@@ -1406,7 +1407,7 @@
     <surefire.Xmx>2800m</surefire.Xmx>
     <surefire.cygwinXmx>2800m</surefire.cygwinXmx>
     <hbase-surefire.argLine>-enableassertions -XX:MaxDirectMemorySize=1G -Xmx${surefire.Xmx}
-      -XX:MaxPermSize=256m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true
+      -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true
       -Djava.awt.headless=true
     </hbase-surefire.argLine>
     <hbase-surefire.cygwin-argLine>-enableassertions -Xmx${surefire.cygwinXmx} -XX:MaxPermSize=256m

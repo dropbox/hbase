@@ -17,14 +17,13 @@
  */
 package org.apache.hadoop.hbase.master.balancer;
 
+import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.Lists;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.ListeningExecutorService;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.common.util.concurrent.*;
+import org.apache.avro.generic.GenericData;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -43,15 +42,8 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * This will find where data for a region is located in HDFS. It ranks
@@ -73,13 +65,61 @@ class RegionLocationFinder {
       new CacheLoader<HRegionInfo, HDFSBlocksDistribution>() {
 
         public ListenableFuture<HDFSBlocksDistribution> reload(final HRegionInfo hri,
-               HDFSBlocksDistribution oldValue) throws Exception {
+                                                               final HDFSBlocksDistribution oldValue) throws Exception {
           return executor.submit(new Callable<HDFSBlocksDistribution>() {
             @Override
             public HDFSBlocksDistribution call() throws Exception {
               return internalGetTopBlockLocation(hri);
             }
           });
+        }
+
+        @Override
+        public Map<HRegionInfo, HDFSBlocksDistribution> loadAll(Iterable<? extends HRegionInfo> hris) throws Exception {
+          HashMap<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> callables = new HashMap<>();
+          for(final HRegionInfo hri:hris) {
+            ListenableFuture<HDFSBlocksDistribution> future = executor.submit(new Callable<HDFSBlocksDistribution>() {
+              @Override
+              public HDFSBlocksDistribution call() throws Exception {
+                return internalGetTopBlockLocation(hri);
+              }
+            });
+            callables.put(hri, future);
+          }
+          int sizeHris = callables.size();
+          Map<HRegionInfo, HDFSBlocksDistribution> result = new HashMap<>(sizeHris);
+
+          LOG.info("Reloading RegionLocationFinder cache for "+sizeHris+" regions");
+          Map<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> failed = new HashMap<>();
+          loadRegionsAsync(callables, result, failed, 1);
+          if(!failed.isEmpty()) {
+            LOG.info("Attempting to refetch "+failed.size() +"  regions with 5 minute timeout");
+            Map<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> newFailures = new HashMap<>();
+            loadRegionsAsync(failed, result, newFailures, 10);
+            for (Map.Entry<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> entry : failed.entrySet()) {
+              entry.getValue().cancel(true);
+            }
+          }
+          LOG.info("Completed bulk RegionLocationFinder cache  for "+sizeHris+" regions");
+          return result;
+        }
+
+        private void loadRegionsAsync(Map<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> callables, Map<HRegionInfo, HDFSBlocksDistribution> result, Map<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> failed, int timeoutMinutes) throws ExecutionException {
+          for (Map.Entry<HRegionInfo, ListenableFuture<HDFSBlocksDistribution>> entry : callables.entrySet()) {
+            HRegionInfo hri = entry.getKey();
+            ListenableFuture<HDFSBlocksDistribution> lf = entry.getValue();
+            try {
+              HDFSBlocksDistribution blocksDistribution = lf.get(timeoutMinutes, TimeUnit.MINUTES);
+              result.put(hri, lf.get());
+              if (result.size() % 5000 == 0) LOG.info("Loading completed of " + result.size() + " regions");
+            } catch(TimeoutException te) {
+              LOG.info("Timeout getting region: " + hri.toString() + " after " + timeoutMinutes + " minutes");
+              failed.put(hri, lf);
+            } catch (InterruptedException ie) {
+              lf.cancel(true);
+              LOG.info("Interrupted getting region: " + hri.toString(), ie);
+            }
+          }
         }
 
         @Override
@@ -95,7 +135,7 @@ class RegionLocationFinder {
     this.cache = createCache();
     executor = MoreExecutors.listeningDecorator(
         Executors.newScheduledThreadPool(
-            5,
+            128,
             new ThreadFactoryBuilder().
                 setDaemon(true)
                 .setNameFormat("region-location-%d")
@@ -104,11 +144,10 @@ class RegionLocationFinder {
 
   /**
    * Create a cache for region to list of servers
-   * @param time time to cache the locations
    * @return A new Cache.
    */
   private LoadingCache<HRegionInfo, HDFSBlocksDistribution> createCache() {
-    return CacheBuilder.newBuilder()
+    return CacheBuilder.newBuilder().concurrencyLevel(128)
         .expireAfterWrite(CACHE_TIME, TimeUnit.MILLISECONDS)
         .build(loader);
   }
@@ -158,8 +197,12 @@ class RegionLocationFinder {
     Set<HRegionInfo> regions = regionStates.getRegionAssignments().keySet();
     boolean includesUserTables = false;
     for (final HRegionInfo hri : regions) {
-      cache.refresh(hri);
       includesUserTables = includesUserTables || !hri.isSystemTable();
+    }
+    try {
+      cache.putAll(loader.loadAll(regions));
+    }catch(Exception ee) {
+      LOG.warn("Error fetching region information", ee);
     }
     return includesUserTables;
   }
