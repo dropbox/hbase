@@ -17,13 +17,12 @@
  */
 package org.apache.hadoop.hbase.master.cleaner;
 
+import java.util.Map;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.hbase.BaseConfigurable;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
-
-import java.util.Map;
 
 /**
  * Base class for file cleaners which allows subclasses to implement a simple
@@ -53,4 +52,8 @@ implements FileCleanerDelegate {
    */
   protected abstract boolean isFileDeletable(FileStatus fStat);
 
+  @Override
+  public void preClean() {
+
+  }
 }

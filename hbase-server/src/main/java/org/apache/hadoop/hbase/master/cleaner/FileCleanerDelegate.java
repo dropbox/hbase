@@ -44,4 +44,9 @@ public interface FileCleanerDelegate extends Configurable, Stoppable {
    * this method is used to pass some instance into subclass
    * */
   void init(Map<String, Object> params);
+
+  /**
+   * Used to do some initialize work before every period clean
+   */
+  void preClean();
 }

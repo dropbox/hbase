@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
@@ -118,7 +119,7 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
 
     final String n = Thread.currentThread().getName();
 
-    StealJobQueue<Runnable> stealJobQueue = new StealJobQueue<>();
+    StealJobQueue<Runnable> stealJobQueue = new StealJobQueue<Runnable>(COMPARATOR);
     this.longCompactions = new ThreadPoolExecutor(largeThreads, largeThreads,
         60, TimeUnit.SECONDS, stealJobQueue,
         new ThreadFactory() {
@@ -454,6 +455,59 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
   public int getRegionSplitLimit() {
     return this.regionSplitLimit;
   }
+
+  private static final Comparator<Runnable> COMPARATOR =
+          new Comparator<Runnable>() {
+
+            private int compare(CompactionRequest r1, CompactionRequest r2) {
+              if (r1 == r2) {
+                return 0; //they are the same request
+              }
+              // less first
+              int cmp = Integer.compare(r1.getPriority(), r2.getPriority());
+              if (cmp != 0) {
+                return cmp;
+              }
+              cmp = Long.compare(r1.getSelectionTime(), r2.getSelectionTime());
+              if (cmp != 0) {
+                return cmp;
+              }
+
+              // break the tie based on hash code
+              return System.identityHashCode(r1) - System.identityHashCode(r2);
+            }
+
+            @Override
+            public int compare(Runnable r1, Runnable r2) {
+              // CompactionRunner first
+              if (r1 instanceof CompactionRunner) {
+                if (!(r2 instanceof CompactionRunner)) {
+                  return -1;
+                }
+              } else {
+                if (r2 instanceof CompactionRunner) {
+                  return 1;
+                } else {
+                  // break the tie based on hash code
+                  return System.identityHashCode(r1) - System.identityHashCode(r2);
+                }
+              }
+              CompactionRunner o1 = (CompactionRunner) r1;
+              CompactionRunner o2 = (CompactionRunner) r2;
+              // less first
+              int cmp = Integer.compare(o1.queuedPriority, o2.queuedPriority);
+              if (cmp != 0) {
+                return cmp;
+              }
+              CompactionContext c1 = o1.compaction;
+              CompactionContext c2 = o2.compaction;
+              if (c1 != null) {
+                return c2 != null ? compare(c1.getRequest(), c2.getRequest()) : -1;
+              } else {
+                return c2 != null ? 1 : 0;
+              }
+            }
+          };
 
   @edu.umd.cs.findbugs.annotations.SuppressWarnings(value="EQ_COMPARETO_USE_OBJECT_EQUALS",
       justification="Contrived use of compareTo")

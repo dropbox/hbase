@@ -18,11 +18,13 @@
  */
 package org.apache.hadoop.hbase.util;
 
+import jdbm.helper.IntegerComparator;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
+import java.util.Comparator;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -36,11 +38,11 @@ import static org.junit.Assert.*;
 public class TestStealJobQueue {
 
   StealJobQueue<Integer> stealJobQueue;
-  BlockingQueue stealFromQueue;
+  BlockingQueue<Integer> stealFromQueue;
 
   @Before
   public void setup() {
-    stealJobQueue = new StealJobQueue<>();
+    stealJobQueue = new StealJobQueue<>(new IntegerComparator());
     stealFromQueue = stealJobQueue.getStealFromQueue();
 
   }
@@ -168,7 +170,13 @@ public class TestStealJobQueue {
 
   @Test
   public void testInteractWithThreadPool() throws InterruptedException {
-    StealJobQueue<Runnable> stealTasksQueue = new StealJobQueue<>();
+    StealJobQueue<Runnable> stealTasksQueue =
+        new StealJobQueue<>(new Comparator<Runnable>() {
+          @Override
+          public int compare(Runnable r1, Runnable r2) {
+            return ((TestTask) r1).compareTo((TestTask) r2);
+          }
+        });
     final CountDownLatch stealJobCountDown = new CountDownLatch(3);
     final CountDownLatch stealFromCountDown = new CountDownLatch(3);
     ThreadPoolExecutor stealPool = new ThreadPoolExecutor(3, 3, 1, TimeUnit.DAYS, stealTasksQueue) {
