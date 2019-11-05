@@ -188,13 +188,19 @@ public final class ProcedureSyncWait {
   }
 
   protected static MasterQuotaManager getMasterQuotaManager(final MasterProcedureEnv env)
-      throws IOException {
+          throws IOException {
     return ProcedureSyncWait.waitFor(env, "quota manager to be available",
-        new ProcedureSyncWait.Predicate<MasterQuotaManager>() {
-      @Override
-      public MasterQuotaManager evaluate() throws IOException {
-        return env.getMasterServices().getMasterQuotaManager();
-      }
-    });
+            new ProcedureSyncWait.Predicate<MasterQuotaManager>() {
+              @Override
+              public MasterQuotaManager evaluate() throws IOException {
+                MasterQuotaManager masterQuotaManager = env.getMasterServices().getMasterQuotaManager();
+                if (masterQuotaManager != null) {
+                  if (masterQuotaManager.isQuotaDisabled() || masterQuotaManager.isQuotaEnabled()) {
+                    return masterQuotaManager;
+                  }
+                }
+                return null;
+              }
+            });
   }
 }

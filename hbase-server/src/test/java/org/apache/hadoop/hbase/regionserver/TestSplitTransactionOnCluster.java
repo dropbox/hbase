@@ -32,7 +32,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.protobuf.RpcController;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -57,36 +59,20 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.UnknownRegionException;
 import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
-import org.apache.hadoop.hbase.client.Admin;
-import org.apache.hadoop.hbase.client.Connection;
-import org.apache.hadoop.hbase.client.ConnectionFactory;
-import org.apache.hadoop.hbase.client.Consistency;
-import org.apache.hadoop.hbase.client.Delete;
-import org.apache.hadoop.hbase.client.Get;
-import org.apache.hadoop.hbase.client.HBaseAdmin;
-import org.apache.hadoop.hbase.client.HTable;
-import org.apache.hadoop.hbase.client.Mutation;
-import org.apache.hadoop.hbase.client.Put;
-import org.apache.hadoop.hbase.client.Result;
-import org.apache.hadoop.hbase.client.ResultScanner;
-import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.client.Table;
+import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.client.TestReplicasClient.SlowMeCopro;
 import org.apache.hadoop.hbase.coordination.ZKSplitTransactionCoordination;
 import org.apache.hadoop.hbase.coordination.ZkCloseRegionCoordination;
 import org.apache.hadoop.hbase.coordination.ZkCoordinatedStateManager;
 import org.apache.hadoop.hbase.coordination.ZkOpenRegionCoordination;
-import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
-import org.apache.hadoop.hbase.coprocessor.ObserverContext;
-import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+import org.apache.hadoop.hbase.coprocessor.*;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.executor.EventType;
-import org.apache.hadoop.hbase.master.AssignmentManager;
-import org.apache.hadoop.hbase.master.HMaster;
-import org.apache.hadoop.hbase.master.RegionState;
+import org.apache.hadoop.hbase.master.*;
 import org.apache.hadoop.hbase.master.RegionState.State;
-import org.apache.hadoop.hbase.master.RegionStates;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos;
+import org.apache.hadoop.hbase.quotas.QuotaUtil;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
 import org.apache.hadoop.hbase.regionserver.compactions.NoLimitCompactionThroughputController;
 import org.apache.hadoop.hbase.security.User;
@@ -137,10 +123,12 @@ public class TestSplitTransactionOnCluster {
     new HBaseTestingUtility();
 
   static void setupOnce() throws Exception {
+    TESTING_UTIL.getConfiguration().set(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY,
+            DelayedInitializationObserver.class.getName());
     TESTING_UTIL.getConfiguration().setInt("hbase.balancer.period", 60000);
     useZKForAssignment = TESTING_UTIL.getConfiguration().getBoolean(
       "hbase.assignment.usezk", true);
-    TESTING_UTIL.startMiniCluster(NB_SERVERS);
+    TESTING_UTIL.startMiniCluster(1, NB_SERVERS, null, MyMaster.class, MiniHBaseCluster.MiniHBaseClusterRegionServer.class);
   }
 
   @BeforeClass public static void before() throws Exception {
@@ -189,6 +177,183 @@ public class TestSplitTransactionOnCluster {
     }
     return hri;
   }
+
+  /**
+   * Verifies HBASE-15911.  When master is starting, region splits should not cause the master to
+   * fail eg NPE due to uninitialized state in the AssignmentManager or elsewhere.
+   *
+   * @throws Exception
+   */
+  @Test(timeout = 120000)
+  public void testSplitBeforeMasterInitialization() throws Exception {
+    if (useZKForAssignment) {
+      LOG.info("Skipping this test because it targets a bug that happens for READY_TO_SPLIT when "
+              + "quotas are enabled and READY_TO_SPLIT is a transition specific to ZKLess assignment");
+      return;
+    }
+
+    final TableName tableName = TableName.valueOf("testSplitBeforeMasterInitialization");
+    HTable t = createTableAndWait(tableName, HConstants.CATALOG_FAMILY);
+    List<HRegion> regions = cluster.getRegions(tableName);
+    HRegionInfo hri = getAndCheckSingleTableRegion(regions);
+
+    LOG.info("Waiting for master to be fully shutdown");
+    ServerName masterName = TESTING_UTIL.getMiniHBaseCluster().getMaster().getServerName();
+    TESTING_UTIL.getMiniHBaseCluster().stopMaster(masterName);
+    TESTING_UTIL.getMiniHBaseCluster().waitForMasterToStop(masterName, 15000);
+
+    try {
+      LOG.info("Starting master with delayed initialization and quota support");
+      DelayedInitializationObserver.enable();
+      TESTING_UTIL.getMiniHBaseCluster().getConfiguration().setBoolean(QuotaUtil.QUOTA_CONF_KEY, true);
+      TESTING_UTIL.getMiniHBaseCluster().startMaster();
+
+      RegionLocator regionLocator = t.getRegionLocator();
+
+      int uncaughtTransitionExceptionsBefore = getUncaughtTransitionExceptions();
+
+      // Split a region, will not succeed, but should not bring down master either
+      LOG.info("Splitting region: " + hri.getEncodedName() + " ON "
+              + regionLocator.getRegionLocation(hri.getStartKey()));
+      TESTING_UTIL.loadTable(t, HConstants.CATALOG_FAMILY, false);
+      admin.splitRegion(hri.getEncodedNameAsBytes());
+
+      // Long enough for the split to be reported back to an uninitialized master.
+      Thread.sleep(5000);
+
+      LOG.info("Resuming master initialization");
+      DelayedInitializationObserver.startSignal.countDown();
+      int uncaughtTransitionExceptionsAfter = getUncaughtTransitionExceptions();
+
+      // Wait some time and ensure that master didn't die and there is only 1 region
+      Thread.sleep(10000);
+      LOG.info("Performing checks now");
+      assertEquals(1, regionLocator.getAllRegionLocations().size());
+      assertTrue(TESTING_UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+      assertEquals(1, TESTING_UTIL.getMiniHBaseCluster().getLiveMasterThreads().size());
+      assertEquals(uncaughtTransitionExceptionsBefore, uncaughtTransitionExceptionsAfter);
+    } finally {
+      DelayedInitializationObserver.reset();
+      TESTING_UTIL.getMiniHBaseCluster().getConfiguration().setBoolean(QuotaUtil.QUOTA_CONF_KEY, false);
+    }
+
+    LOG.info("Waiting for master to be fully shutdown");
+    masterName = TESTING_UTIL.getMiniHBaseCluster().getMaster().getServerName();
+    TESTING_UTIL.getMiniHBaseCluster().stopMaster(masterName);
+    TESTING_UTIL.getMiniHBaseCluster().waitForMasterToStop(masterName, 15000);
+
+    /* Now test without quotas, region split should succeed even though master is not initialized
+     * completely and master should not die.
+     */
+
+    try {
+      LOG.info("Starting master with delayed initialization");
+      DelayedInitializationObserver.enable();
+      TESTING_UTIL.getMiniHBaseCluster().startMaster();
+
+      RegionLocator regionLocator = t.getRegionLocator();
+
+      int uncaughtTransitionExceptionsBefore = getUncaughtTransitionExceptions();
+
+      // Split a region, should succeed
+      LOG.info("Splitting region: " + hri.getEncodedName() + " ON "
+              + regionLocator.getRegionLocation(hri.getStartKey()));
+      TESTING_UTIL.loadTable(t, HConstants.CATALOG_FAMILY, false);
+      admin.splitRegion(hri.getEncodedNameAsBytes());
+
+      // Long enough for the split to be reported back to an uninitialized master.
+      Thread.sleep(5000);
+
+      LOG.info("Resuming master initialization");
+      DelayedInitializationObserver.startSignal.countDown();
+
+      int uncaughtTransitionExceptionsAfter = getUncaughtTransitionExceptions();
+
+      // Wait some time and ensure that master didn't die and there are 2 regions
+      Thread.sleep(10000);
+      LOG.info("Performing checks now");
+      assertEquals(2, regionLocator.getAllRegionLocations().size());
+      assertTrue(TESTING_UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+      assertTrue(TESTING_UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+      assertEquals(1, TESTING_UTIL.getMiniHBaseCluster().getLiveMasterThreads().size());
+      assertEquals(uncaughtTransitionExceptionsBefore, uncaughtTransitionExceptionsAfter);
+    } finally {
+      DelayedInitializationObserver.reset();
+    }
+  }
+
+  public static class DelayedInitializationObserver extends BaseMasterObserver {
+    private static volatile boolean enabled = false;
+    private static volatile CountDownLatch startSignal = new CountDownLatch(1);
+
+    @Override
+    public void preMasterInitialization(ObserverContext<MasterCoprocessorEnvironment> ctx)
+            throws IOException {
+      if (!enabled) {
+        return;
+      }
+      LOG.info("Delaying master initialization in coproc");
+      try {
+        startSignal.await();
+      } catch (InterruptedException e) {
+        LOG.error("Unexpected interrupt", e);
+      }
+      LOG.info("Resuming master initialization in coproc");
+    }
+
+    public static void enable() {
+      enabled = true;
+    }
+
+    public static void reset() {
+      enabled = false;
+      startSignal = new CountDownLatch(1);
+    }
+  }
+
+  private int getUncaughtTransitionExceptions() {
+    MyMaster master = (MyMaster) TESTING_UTIL.getMiniHBaseCluster().getMaster();
+    if (master == null) return 0;
+    MyMaster.MyMasterRpcServices rpcServices = ((MyMaster.MyMasterRpcServices) master.getMasterRpcServices());
+    if (rpcServices == null) return 0;
+    return rpcServices.uncaughtTransitionExceptions.get();
+  }
+
+  public static class MyMaster extends HMaster {
+
+    public MyMaster(Configuration conf, CoordinatedStateManager cp)
+            throws IOException, KeeperException,
+            InterruptedException {
+      super(conf, cp);
+    }
+
+    @Override
+    protected RSRpcServices createRpcServices() throws IOException {
+      return new MyMasterRpcServices(this);
+    }
+
+    public static class MyMasterRpcServices extends MasterRpcServices {
+      final AtomicInteger uncaughtTransitionExceptions = new AtomicInteger();
+
+      public MyMasterRpcServices(HMaster m) throws IOException {
+        super(m);
+      }
+
+      @Override
+      public RegionServerStatusProtos.ReportRegionStateTransitionResponse reportRegionStateTransition(RpcController c,
+                                                                                                      RegionServerStatusProtos.ReportRegionStateTransitionRequest req) throws ServiceException {
+        try {
+          return super.reportRegionStateTransition(c, req);
+        } catch (ServiceException e1) {
+          throw e1;
+        } catch (Exception e2) {
+          uncaughtTransitionExceptions.addAndGet(1);
+          throw e2;
+        }
+      }
+    }
+  }
+
 
   @Test(timeout = 60000)
   public void testShouldFailSplitIfZNodeDoesNotExistDueToPrevRollBack() throws Exception {
@@ -745,7 +910,7 @@ public class TestSplitTransactionOnCluster {
    * @throws KeeperException
    * @throws DeserializationException
    */
-  @Test(timeout = 400000)
+  @Test(timeout = 500000)
   public void testMasterRestartWhenSplittingIsPartial()
       throws IOException, InterruptedException, NodeExistsException,
       KeeperException, DeserializationException, ServiceException {
@@ -800,11 +965,14 @@ public class TestSplitTransactionOnCluster {
 
       // Update the region to be offline and split, so that HRegionInfo#equals
       // returns true in checking rebuilt region states map.
+      ServerName regionServerOfRegion = master.getAssignmentManager()
+              .getRegionStates().getRegionServerOfRegion(hri);
+      assertTrue(regionServerOfRegion == null);
+
       hri.setOffline(true);
       hri.setSplit(true);
-      ServerName regionServerOfRegion = master.getAssignmentManager()
-        .getRegionStates().getRegionServerOfRegion(hri);
-      assertTrue(regionServerOfRegion != null);
+      waitOnRIT(hri);
+
 
       // Remove the block so that split can move ahead.
       AssignmentManager.TEST_SKIP_SPLIT_HANDLING = false;
@@ -818,8 +986,9 @@ public class TestSplitTransactionOnCluster {
       }
       assertNull("Waited too long for ZK node to be removed: "+node, data);
       RegionStates regionStates = master.getAssignmentManager().getRegionStates();
+      waitOnRIT(hri);
       assertTrue("Split parent should be in SPLIT state",
-        regionStates.isRegionInState(hri, State.SPLIT));
+        hri.isSplit());
       regionServerOfRegion = regionStates.getRegionServerOfRegion(hri);
       assertTrue(regionServerOfRegion == null);
     } finally {

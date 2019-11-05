@@ -758,6 +758,10 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
     status.setStatus("Initializing master coprocessors");
     this.cpHost = new MasterCoprocessorHost(this, this.conf);
 
+    // create the quota manager but don't start it until master is initialized later
+    quotaManager = new MasterQuotaManager(this);
+    this.assignmentManager.setRegionStateListener((RegionStateListener) quotaManager);
+
     // start up all service threads.
     status.setStatus("Initializing master service threads");
     startServiceThreads();
@@ -877,7 +881,7 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
     setInitialized(true);
 
     status.setStatus("Starting quota manager");
-    initQuotaManager();
+    quotaManager.start();
 
     // assign the meta replicas
     Set<ServerName> EMPTY_SET = new HashSet<ServerName>();
@@ -915,12 +919,6 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
     }
 
     zombieDetector.interrupt();
-  }
-
-  private void initQuotaManager() throws IOException {
-    quotaManager = new MasterQuotaManager(this);
-    this.assignmentManager.setRegionStateListener((RegionStateListener) quotaManager);
-    quotaManager.start();
   }
 
   /**
